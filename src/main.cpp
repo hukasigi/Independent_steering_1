@@ -1,6 +1,7 @@
 #include "AnglePID.h"
 #include "SpeedPID.h"
 #include <Arduino.h>
+#include <CAN.h>
 #include <ESP32Encoder.h>
 #include <PS4Controller.h>
 
@@ -21,16 +22,52 @@ constexpr int     PWM_DEADBAND = 8;
 constexpr int      HOMING_PWM        = 70;
 constexpr uint32_t HOMING_TIMEOUT_MS = 8000;
 
+constexpr int16_t MOTOR_CURRENT_LIMIT = 2000;
+
 // グローバル変数
 ESP32Encoder encoder;
-AnglePID     anglePID(1.5, 0.0, 0.01, -300.0, 300.0, ENC_RESOLUTION, -10.0, 10.0);
-SpeedPID     speed_pid_1(3., 3., 0.00, -PWM_LIMIT, PWM_LIMIT);
+AnglePID     anglePID_STEER_1(5., 0.0, 0.0, -300.0, 300.0, 360.0, -10.0, 10.0);
+SpeedPID     speedPID_STEER_1(1., 20., 0.00, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID     speedPID_DRIVE_1(1., 20., 0.00, -MOTOR_CURRENT_LIMIT, MOTOR_CURRENT_LIMIT);
 
 volatile long encoderCount      = 0;
 volatile bool zeroPointDetected = false;
 
 bool homingDone  = false;
 bool homingError = false;
+
+volatile int16_t angle   = 0;
+volatile int16_t speed   = 0;
+volatile int16_t current = 0;
+volatile uint8_t temp    = 0;
+
+volatile int16_t prev_raw_angle       = 0;
+volatile int32_t cumulative_raw_angle = 0;
+volatile double  output_angle         = 0.0;
+
+void onReceive(int packetSize) {
+    if (CAN.packetId() != 0x202) {
+        while (CAN.available())
+            CAN.read();
+        return;
+    }
+
+    if (packetSize < 8) {
+        while (CAN.available())
+            CAN.read();
+        return;
+    }
+
+    uint8_t data[8] = {0};
+    for (int i = 0; i < 8 && CAN.available(); i++) {
+        data[i] = (uint8_t)CAN.read();
+    }
+
+    int16_t raw_angle = (int16_t)((data[0] << 8) | data[1]);
+    speed             = (int16_t)((data[2] << 8) | data[3]);
+    current           = (int16_t)((data[4] << 8) | data[5]);
+    temp              = data[6];
+}
 
 // Z相割り込みハンドラ
 void IRAM_ATTR onZPhase() {
@@ -84,6 +121,7 @@ bool runSteerHoming() {
             Serial.println("[HOMING] Z detected on + sweep. Homing OK.");
             return true;
         }
+
         if (millis() - t0 > HOMING_TIMEOUT_MS) break;
         delay(2);
     }
@@ -112,6 +150,7 @@ bool runSteerHoming() {
     Serial.println("[HOMING][ERROR] Z phase not detected. Check encoder/Z wiring.");
     return false;
 }
+unsigned long last = micros();
 
 void setup() {
     Serial.begin(115200);
@@ -120,7 +159,7 @@ void setup() {
     pinMode(PIN_STEER_MOTOR_DIR, OUTPUT);
 
     ESP32Encoder::useInternalWeakPullResistors = puType::up;
-    encoder.attachFullQuad(PIN_ENC_A, PIN_ENC_B);
+    encoder.attachHalfQuad(PIN_ENC_A, PIN_ENC_B);
     pinMode(PIN_ENC_Z, INPUT);
     encoder.clearCount();
     attachInterrupt(digitalPinToInterrupt(PIN_ENC_Z), onZPhase, RISING);
@@ -128,16 +167,38 @@ void setup() {
     ledcSetup(W1_CH, 12800, 8);
     ledcAttachPin(PIN_STEER_MOTOR_PWM, W1_CH);
 
-    PS4.begin("00:11:22:33:44:55");
+    PS4.begin("e4:65:b8:7e:05:4a");
+
+    CAN.setPins(4, 5); // RX, TX
+
+    if (!CAN.begin(1000000)) {
+        Serial.println("CAN init failed");
+        while (1)
+            ;
+    }
+
+    CAN.onReceive(onReceive);
+
+    volatile uint32_t* pREG_IER = (volatile uint32_t*)0x3ff6b010;
+    *pREG_IER &= ~(uint8_t)0x10;
 
     homingDone  = runSteerHoming();
     homingError = !homingDone;
 
+    last = micros();
+
     Serial.println("Setup complete");
 }
 
-unsigned long     last          = micros();
 constexpr int32_t CONTROL_CYCLE = 5000;
+
+static double normalizeAngleDeg(double a) {
+    while (a > 180.0)
+        a -= 360.0;
+    while (a < -180.0)
+        a += 360.0;
+    return a;
+}
 
 void loop() {
     if (homingError) {
@@ -164,32 +225,59 @@ void loop() {
     last      = now;
 
     // 右スティックをベクトルとして読む
-    int rx = PS4.RStickX(); // -128..127
-    int ry = PS4.RStickY();
-
-    // 角度 [deg]
+    int    rx            = -PS4.RStickX(); // -128..127
+    int    ry            = PS4.RStickY();
     double stickAngleDeg = atan2((double)ry, (double)rx) * 180.0 / M_PI;
-
-    // 距離（0..約180）
+    // スティック上（ry正）を 0° にするため 90° シフト
+    stickAngleDeg   = normalizeAngleDeg(stickAngleDeg - 90.0);
     double stickMag = hypot((double)rx, (double)ry);
 
-    // デッドゾーン
+    // デッドゾーン処理
     const double DEADZONE   = 15.0;
     double       moveOutput = 0.0;
     if (stickMag > DEADZONE) {
-        moveOutput = (stickMag - DEADZONE) / (127.0 - DEADZONE) * PWM_LIMIT;
-        moveOutput = constrain(moveOutput, 0.0, (double)PWM_LIMIT);
+        moveOutput = (stickMag - DEADZONE) / (127.0 - DEADZONE) * MOTOR_CURRENT_LIMIT;
+        moveOutput = constrain(moveOutput, 0.0, (double)MOTOR_CURRENT_LIMIT);
     }
 
-    // ステア角目標として使うなら
-    double angleTargetDeg = stickAngleDeg;
-
     double currentAngleDeg = (encoder.getCount() * 360.0 / ENC_RESOLUTION) / STEER_GEAR_RATIO_MOTOR_TO_STEER;
+    currentAngleDeg        = normalizeAngleDeg(currentAngleDeg);
 
-    int steerOutput = (int)anglePID.update(angleTargetDeg, currentAngleDeg, dt);
-    setMotor(PIN_STEER_MOTOR_DIR, W1_CH, +1, steerOutput);
+    // スティックを戻したら「現在の目標角度を保持」
+    static bool   targetInitialized  = false;
+    static double holdAngleTargetDeg = 0.0;
+    if (!targetInitialized) {
+        holdAngleTargetDeg = currentAngleDeg; // 起動直後の急な飛びを防止
+        targetInitialized  = true;
+    }
 
-    Serial.printf("rx=%d ry=%d angle=%.1f mag=%.1f move=%.1f\n", rx, ry, stickAngleDeg, stickMag, moveOutput);
+    if (stickMag > DEADZONE) {
+        holdAngleTargetDeg = normalizeAngleDeg(stickAngleDeg);
+    }
+    double angleTargetDeg = holdAngleTargetDeg;
 
-    delay(10);
+    double targetSpeedRPM = anglePID_STEER_1.update(angleTargetDeg, currentAngleDeg, dt);
+
+    static long prev_enc = 0;
+    long        enc_now  = encoder.getCount();
+    long        delta    = enc_now - prev_enc;
+    prev_enc             = enc_now;
+
+    double motorRpm = (((double)delta / ENC_RESOLUTION) / dt * 60.0);
+
+    double steerMotorOutput = speedPID_STEER_1.update(targetSpeedRPM, motorRpm, dt);
+
+    // デバッグ出力（追加）: 符号・値の確認用
+    Serial.printf("angleT:%.1f angle:%.1f  rpm:%.1f ,speed:%d\n", angleTargetDeg, currentAngleDeg, motorRpm, speed);
+
+    setMotor(PIN_STEER_MOTOR_DIR, W1_CH, 1, (int)steerMotorOutput);
+
+    int16_t motor_current = speedPID_DRIVE_1.update(moveOutput, speed, dt);
+
+    CAN.beginPacket(0x200);
+    for (int i = 0; i < 4; i++) {
+        CAN.write(motor_current >> 8);
+        CAN.write(motor_current & 0xFF);
+    }
+    CAN.endPacket();
 }
